@@ -4,30 +4,39 @@
 \alias{rrscale}
 \title{Re-scale a data matrix}
 \usage{
-rrscale(Y, trans_list = list(box_cox_negative = box_cox_negative, asinh =
-  asinh), lims_list = list(box_cox_negative = c(-100, 100), asinh =
-  list(0, 100)), opt_control = NULL, ncores = NULL, z = 4,
-  q = 0.001, run_parallel = TRUE, verbose = FALSE, zeros = FALSE,
-  opts = FALSE, seed = NULL)
+rrscale(
+  Y,
+  trans_list = list(box_cox_negative = box_cox_negative, asinh = asinh),
+  lims_list = list(box_cox_negative = c(-100, 100), asinh = list(0, 100)),
+  opt_control = NULL,
+  opt_method = "DEoptim",
+  z = 4,
+  q = 0.001,
+  verbose = FALSE,
+  log_dir = ".rrscale/",
+  zeros = FALSE,
+  opts = FALSE,
+  seed = NULL
+)
 }
 \arguments{
-\item{Y}{Data matrix to be transformed.}
+\item{Y}{Data matrix, data.frame, or list of vectors, to be transformed.}
 
 \item{trans_list}{List of transformations to be considered. See function list_transformations. Each element of the list should be a list containing the transformation function as the first element and the derivative of the transformation function as the second argument. The first argument of each function should be the data, the second the transformation parameter.}
 
-\item{lims_list}{List of optimization limits for each transformation from trans_list. This should be a list with one element per transforamtion parmeter. The element of the list for each transforamtion family should be a list of two-element vectors control the limits for each parameter of the transformation family.}
+\item{lims_list}{List of optimization limits for each transformation from trans_list. This should be a list the same length as \code{trans_list}. Each element of the list is a two-element vector that sets the optimization limits for the parameter of each transformation family.}
 
 \item{opt_control}{Optional optimization controlling parameters for DEoptim control argument. See the DEoptim package for details.}
 
-\item{ncores}{Number of cores to use if running parallel.}
+\item{opt_method}{Which optimization method to use. Defaults to DEoptim. Other choice is nloptr.}
 
 \item{z}{The O-step cutoff value. Points are removed if their robust z-score is above z in magnitude.}
 
 \item{q}{The Z-step winsorizing quantile cutoff. The quantile at which to winsorize the data when calculating the robust z-scores.}
 
-\item{run_parallel}{a boolean, if TRUE the method will be run run column-wise in parallel.}
+\item{verbose}{a boolean, if TRUE then save optimization output in log_dir.}
 
-\item{verbose}{a boolean, if TRUE then save optimization output in local directory '.rrscale'}
+\item{log_dir}{directory for verbose output. Defaults to ".rrscale/"}
 
 \item{zeros}{How to deal with zeros in the data set. If set to FALSE the algorithm will fail if it encounters a zero. If set to a number or 'NA' then the zeros are replaced by this number or 'NA'.}
 
@@ -67,6 +76,6 @@ This transformation is three steps (1) Gaussianize the data, (2) z-score Transfo
 }
 \examples{
 Y <- rlnorm(10)\%*\%t(rlnorm(10))
-rr.out <- rrscale(Y,run_parallel=FALSE)
+rr.out <- rrscale(Y)
 Yt <- rr.out$RR
 }

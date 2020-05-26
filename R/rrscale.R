@@ -2,15 +2,15 @@
 #' 
 #' This transformation is three steps (1) Gaussianize the data, (2) z-score Transform the data, and (3) remove extreme outliers from the data. The sequence of these transformations helps focus further analyses on consequential variance in the data rather than having it be focused on variation resulting from the feature's measurement scale or outliers. 
 #' @export
-#' @param Y Data matrix to be transformed.
+#' @param Y Data matrix, data.frame, or list of vectors, to be transformed.
 #' @param trans_list List of transformations to be considered. See function list_transformations. Each element of the list should be a list containing the transformation function as the first element and the derivative of the transformation function as the second argument. The first argument of each function should be the data, the second the transformation parameter.
-#' @param lims_list List of optimization limits for each transformation from trans_list. This should be a list with one element per transforamtion parmeter. The element of the list for each transforamtion family should be a list of two-element vectors control the limits for each parameter of the transformation family. 
-#' @param opt_control Optional optimization controlling parameters for DEoptim control argument. See the DEoptim package for details. 
+#' @param lims_list List of optimization limits for each transformation from trans_list. This should be a list the same length as \code{trans_list}. Each element of the list is a two-element vector that sets the optimization limits for the parameter of each transformation family. 
+#' @param opt_control Optional optimization controlling parameters for DEoptim control argument. See the DEoptim package for details.
+#' @param opt_method Which optimization method to use. Defaults to DEoptim. Other choice is nloptr. 
 #' @param z The O-step cutoff value. Points are removed if their robust z-score is above z in magnitude. 
 #' @param q The Z-step winsorizing quantile cutoff. The quantile at which to winsorize the data when calculating the robust z-scores. 
-#' @param ncores Number of cores to use if running parallel. 
-#' @param run_parallel a boolean, if TRUE the method will be run run column-wise in parallel. 
-#' @param verbose a boolean, if TRUE then save optimization output in local directory '.rrscale'
+#' @param verbose a boolean, if TRUE then save optimization output in log_dir.
+#' @param log_dir directory for verbose output. Defaults to ".rrscale/"
 #' @param zeros How to deal with zeros in the data set. If set to FALSE the algorithm will fail if it encounters a zero. If set to a number or 'NA' then the zeros are replaced by this number or 'NA'.
 #' @param opts Boolean determining if optimization output is returned. Defaults to FALSE. 
 #' @param seed Sets the seed before running any other analyses. 
@@ -41,36 +41,52 @@
 #' }
 #' @examples
 #' Y <- rlnorm(10)%*%t(rlnorm(10))
-#' rr.out <- rrscale(Y,run_parallel=FALSE)
+#' rr.out <- rrscale(Y)
 #' Yt <- rr.out$RR
-#' @importFrom foreach %do% %dopar% foreach
-#' @importFrom doParallel registerDoParallel
-#' @importFrom parallel detectCores makeCluster stopCluster
 #' @importFrom DEoptim DEoptim DEoptim.control
+#' @importFrom nloptr nloptr
 rrscale <- function(Y, trans_list=list(box_cox_negative=box_cox_negative,
                                        asinh=asinh),
                     lims_list=list(box_cox_negative = c(-100,100),
                                    asinh=list(0,100)),
-                  opt_control = NULL, ncores = NULL, z=4, q=0.001,
-                  run_parallel = TRUE, verbose = FALSE, zeros = FALSE, opts=FALSE, seed = NULL) {
+                  opt_control = NULL, opt_method="DEoptim", z=4, q=0.001, verbose = FALSE, log_dir=".rrscale/", zeros = FALSE, opts=FALSE, seed = NULL) {
     
     set.seed(seed)
 
+    if(is.matrix(Y))
+        Y<-as.data.frame(Y)
+
+    ## deal with zeros
     if (is.na(zeros) | !is.logical(zeros)){
-        Y[which(Y == 0)] <- zeros
+        if(is.data.frame(Y))
+            Y = data.frame(apply(Y,c(1,2),function(x)ifelse(x==0,zeros,x)))
+        else
+            Y = lapply(Y,function(x){
+                x[which(x==0)] <- zeros
+                return(x)
+            })
+    }
+
+    if(is.logical(zeros)){
+        num_zeros = sum(sapply(Y,function(x)sum(x==0,na.rm=TRUE)),na.rm=TRUE)
+        if(num_zeros>0) 
+            stop("Cannot transform with values of '0'. Please see 'zeros' argument for options to solve this issue.")
     }
     
     # Find optimial parameter for each transformation family considered in trans_list
     sdns <- lapply(seq_along(trans_list), function(i) rrscale_trans(Y, trans_list[[i]], 
-        lims_list[[i]], opt_control = opt_control, ncores = ncores, run_parallel = run_parallel, 
-        verbose = verbose, zeros = zeros))
+        lims_list[[i]], opt_control = opt_control, opt_method=opt_method,
+        verbose = verbose, log_dir=log_dir, zeros = zeros))
     names(sdns) <- names(trans_list)
     
     # Find the optimal transformation across families
     OBJ <- sapply(sdns, "[[", "objs")
     if (is.null(dim(OBJ))) 
         OBJ <- array(OBJ, c(1, length(sdns)))
-    min_OBJ <- factor(apply(OBJ, 1, which.min))
+    wm_na = function(x){
+        ifelse(all(is.na(x)),NA,which.min(x))
+    }
+    min_OBJ <- factor(apply(OBJ, 1, wm_na))
     min_OBJ <- ordered(min_OBJ, levels = 1:ncol(OBJ))
     opt_trans <- which.max(table(min_OBJ))
     
@@ -90,26 +106,37 @@ rrscale <- function(Y, trans_list=list(box_cox_negative=box_cox_negative,
     RR_fn = function(Y,G=TRUE,Z=TRUE,O=TRUE,
                      lambda=lambda_hat,T=T_opt,mu=NULL,sigma=NULL,q=0.001,z=4){
 
+        nms = names(Y)
+        if(is.matrix(Y))
+            Y<-as.data.frame(Y)
+        df_flag = is.data.frame(Y)
+
         G_fn = function(Y,lambda=lambda_hat, T=T){
-            return(T(Y,lambda))
+            return(lapply(Y,T,lambda))
         }
 
         Z_fn = function(Y,mu=NULL,sigma=NULL,q=0.001){
-            Y_tmp <- as.matrix(Y)
+            mbship = rep(1:length(Y),times=lengths(Y))
+            Y_tmp = unlist(Y)
             Yw <- winsor(Y_tmp, q)
             if(is.null(mu))
                 mu <- mean(Yw, na.rm = TRUE)
             Ywc <- Yw - mu
             if(is.null(sigma))
                 sigma <- sqrt(mean(Ywc^2, na.rm = TRUE))
-            Z <- (Y_tmp - mu)/sigma
+            Ywcs = (Y_tmp - mu)/sigma
+            names(Ywcs) <- NULL
+            Z <- lapply(unique(mbship),function(m)Ywcs[mbship==m])
             return(Z)
         }
 
         O_fn = function(Y,z=4,mu=NULL,sigma=NULL,q=0.001){
             Z = Z_fn(Y,mu=mu,sigma=sigma,q=q)
-            O = Y
-            O[abs(Z)>z] <- NA
+            O = lapply(1:length(Y),function(i){
+                oout = Y[[i]]
+                oout[abs(Z[[i]])>z] <- NA
+                return(oout)
+            })
             return(O)
         }
 
@@ -119,7 +146,11 @@ rrscale <- function(Y, trans_list=list(box_cox_negative=box_cox_negative,
             Y <- Z_fn(Y,mu=mu,sigma=sigma,q=q)
         if(O)
             Y <- O_fn(Y,z=z,mu=mu,sigma=sigma,q=q)
-        return(as.matrix(Y))
+
+        if(df_flag)
+            Y <- as.data.frame(Y)
+        names(Y) <- nms
+        return(Y)
     }
 
     RRsub = subClosure(RR_fn,c("lambda_hat","T","T_opt","q","z"))
@@ -132,7 +163,7 @@ rrscale <- function(Y, trans_list=list(box_cox_negative=box_cox_negative,
     ret_list = list(opts = opt_return, # optimization output
                     pars = lambdas, # estimated columnwise parameters
                     par_hat = lambda_hat, # overall estimated parameter
-                    NT = as.matrix(Y), # No transformation
+                    NT = Y, # No transformation
                     RR = RR_fn(Y,z=z,q=q), # three-step RR transformation
                     G = RR_fn(Y,Z=FALSE,O=FALSE,z=z,q=q), # G only
                     Z = RR_fn(Y,G=FALSE,O=FALSE,z=z,q=q), # Z only
@@ -144,11 +175,11 @@ rrscale <- function(Y, trans_list=list(box_cox_negative=box_cox_negative,
                     alg_control = list(trans_list, # args passed to rrscale
                                        lims_list,
                                        opt_control = opt_control,
+                                       opt_method=opt_method,
                                        z=z,
                                        q=q,
-                                       ncores = ncores,
-                                       run_parallel = run_parallel, 
                                        verbose = verbose,
+                                       log_dir = log_dir,
                                        zeros = zeros,
                                        seed = seed
                                        )
@@ -157,31 +188,22 @@ rrscale <- function(Y, trans_list=list(box_cox_negative=box_cox_negative,
     return(ret_list)
 }
 
-rrscale_trans <- function(Y, tns, lims, opt_control = NULL, ncores = NULL, run_parallel = TRUE, 
-    verbose = TRUE, zeros = FALSE) {
+rrscale_trans <- function(Y, tns, lims, opt_control = NULL, opt_method="DEoptim",
+    verbose = TRUE, log_dir=".rrscale/", zeros = FALSE) {
     T <- tns$T
     T_deriv <- tns$T_deriv
-
-    if(is.logical(zeros)){
-        if ((length(which(Y == 0)) > 0) && !zeros) 
-            return(list(opts = NULL, lambdas = NA, objs = NA))
-    }
     
-    opts <- rrscale_opt(Y, lims, T, T_deriv, opt_control = opt_control, ncores = ncores, 
-        run_parallel = run_parallel, verbose = verbose, zeros = zeros)
+    opts <- rrscale_opt(Y, lims, T, T_deriv, opt_control = opt_control,opt_method=opt_method,
+                        verbose = verbose, log_dir=log_dir,zeros = zeros)
     lambdas <- sapply(opts, "[[", "est")
     objs <- sapply(opts, "[[", "obj")
     return(list(opts = opts, lambdas = lambdas, objs = objs))
 }
 
 
-rrscale_opt <- function(Y, lims, T, T_deriv, opt_control = NULL, ncores = NULL, run_parallel = TRUE, 
-    verbose = TRUE, zeros = FALSE) {
-    
-    if (is.null(opt_control)) 
-        opt_control <- DEoptim.control(trace = verbose, reltol = 1e-10, itermax = 10000, 
-            steptol = 100)
-    
+rrscale_opt <- function(Y, lims, T, T_deriv, opt_control = NULL,opt_method="DEoptim",
+                        verbose = TRUE, log_dir=".rrscale/", zeros = FALSE) {
+        
     obj <- function(l, y) {
         y <- y[!is.na(y)]
         yt <- T(y, l)
@@ -201,49 +223,58 @@ rrscale_opt <- function(Y, lims, T, T_deriv, opt_control = NULL, ncores = NULL, 
     est_col <- function(y) {
         y <- y[!is.na(y)]
         obj_fn <- function(l) obj(l, y)
-        tryCatch({
-            opt <- DEoptim(fn = obj_fn, lower = lims[[1]], upper = lims[[2]], control = opt_control)
+        ret = tryCatch({
+            stopifnot(length(y)>0)
+            opt_fn(fn = obj_fn, lower = lims[[1]], upper = lims[[2]], opt_control = opt_control, opt_method=opt_method,verbose=verbose)
         }, error = function(e) {
             print(e)
+            NULL
         })
-        if (!is.finite(opt$optim$bestmem)) 
-            list(est = NA, obj = NA, l_tried = NA, obj_tried = NA, opt = NA)
         
-        l_best <- opt$member$bestmemit
-        v_best <- opt$member$bestvalit
-        l_ord <- order(l_best)
-        l_best <- l_best[l_ord]
-        v_best <- v_best[l_ord]
-        
-        return(list(est = opt$optim$bestmem, obj = opt$optim$bestval, l_tried = l_best, 
-            obj_tried = v_best, opt = opt))
-    }
-    
-    operator <- `%do%`
-    if (run_parallel) {
-        operator <- `%dopar%`
-        if (is.null(ncores)) 
-            ncores <- detectCores() - 2
-        cl <- makeCluster(ncores)
-        registerDoParallel(cl)
+        return(ret)
     }
     
     if (verbose) 
-        dir.create(".rrscale", showWarnings = FALSE, recursive = TRUE)
+        dir.create(log_dir, showWarnings = FALSE, recursive = TRUE)
 
     i <- 0 
-    opts <- operator(foreach(i = 1:ncol(Y)), {
+    opts <- lapply(1:length(Y),function(i){
         fn <- NULL
         if (verbose) 
-            fn <- paste0(".rrscale/", i, ".log")
+            fn <- paste0(log_dir, i, ".log")
         utils::capture.output({
-            out <- est_col(Y[, i, drop = FALSE])
+            out <- est_col(Y[[i]])
         }, file = fn)
         return(out)
     })
     
-    if (run_parallel) 
-        stopCluster(cl)
-    
     return(opts)
+}
+
+
+opt_fn = function(fn = NULL, lower = NULL, upper = NULL, opt_control = NULL,opt_method="DEoptim",verbose=FALSE){
+    
+    if(opt_method == "DEoptim"){
+        if (is.null(opt_control)) 
+            opt_control <- DEoptim.control(trace = verbose, reltol = 1e-10, itermax = 10000, 
+                                           steptol = 100)
+        opt=DEoptim(fn=fn,lower=lower,upper=upper,control=opt_control)
+        ret = list(est = opt$optim$bestmem, obj = opt$optim$bestval, opt = opt)
+    }
+
+    if(opt_method=="nloptr"){
+        if(is.null(opt_control)){
+            opt_control <- list("algorithm"="NLOPT_GN_CRS2_LM",
+                                'maxeval'=1000,
+                                'xtol_rel'=1E-10)
+        }
+        opt = nloptr(x0=1,eval_f=fn,lb=lower,ub=upper,opts=opt_control)
+        ret = list(est = opt$solution, obj = opt$objective, opt = opt)
+    }
+
+    if (is.null(opt)){
+        ret = list(est = NA, obj = NA, opt = NA)
+    }
+
+    return(ret)
 }
